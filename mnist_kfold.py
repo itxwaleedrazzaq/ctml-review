@@ -35,6 +35,20 @@ base_model_name = 'Event_based_MNIST'
 weights_dir = 'model_weights'
 os.makedirs(weights_dir, exist_ok=True)
 
+# SHARED HYPERPARAMETERS
+hidden_dim = ff_dim = ncp_units = 64 # model width (d_model/dim/units/embed_dim/key_dim/state_size)
+num_unfolds = 5                      # ODE solver steps
+d_state = 16                         # S7/Jamba SSM state dimension
+d_conv = 4                           # S7/Jamba convolution width
+num_steps = 5                        # OT-Transformer iterations / PDE-Attention nt
+max_len = 256                        # event sequence length
+num_classes = 10
+batch_size = 32
+learning_rate = 0.001
+epochs = 50
+k_folds = 5
+random_state = 42
+
 # Load MNIST dataset
 (x_train, y_train), (x_test, y_test) = mnist.load_data()
 X = np.concatenate([x_train, x_test], axis=0)
@@ -61,18 +75,18 @@ def event_based_compression(seq):
     events.append((prev_val, t))
     return events
 
-def normalize_time(events, max_len=256):
+def normalize_time(events, max_len=max_len):
     total_time = sum(t for _, t in events)
     scale = max_len / total_time
     return [(val, t * scale) for val, t in events]
 
-def pad_events(events, max_len=256):
+def pad_events(events, max_len=max_len):
     events = events[:max_len]
     if len(events) < max_len:
         events += [(0, 0)] * (max_len - len(events))
     return events
 
-def preprocess_dataset(images, labels, max_len=256):
+def preprocess_dataset(images, labels, max_len=max_len):
     event_data = []
     for img in images:
         binary_img = binarize(img)
@@ -87,64 +101,88 @@ def preprocess_dataset(images, labels, max_len=256):
 X_events, y = preprocess_dataset(X, y)
 
 # Wiring
-ncp_wiring = AutoNCP(units=64,output_size=10)
+ncp_wiring = AutoNCP(units=ncp_units, output_size=num_classes)
 
 # ---- Model builder ----
-def build_model(cell_type, input_shape=(256,2), num_classes=10):
+def build_model(cell_type, input_shape=(max_len, 2), num_classes=num_classes):
     inp = Input(shape=input_shape)
-    x = Conv1D(64, kernel_size=5, activation='relu', padding='same', strides=5)(inp)
-    x = Conv1D(64, kernel_size=5, activation='relu', padding='same', strides=5)(x)
-    
+    x = Conv1D(hidden_dim, kernel_size=5, activation='relu', padding='same', strides=5)(inp)
+    x = Conv1D(hidden_dim, kernel_size=5, activation='relu', padding='same', strides=5)(x)
+
     if cell_type == "LSTM":
-        x = RNN(LSTMCell(64), return_sequences=False)(x)
+        x = RNN(LSTMCell(hidden_dim), return_sequences=False)(x)
     elif cell_type == "GRU":
-        x = RNN(GRUCell(64), return_sequences=False)(x)
+        x = RNN(GRUCell(hidden_dim), return_sequences=False)(x)
     elif cell_type == "SDPA-Transformer":
-        x = SPDATransformer(embed_dim=64, num_heads=16,ff_dim=32)(x)
+        x = SPDATransformer(embed_dim=hidden_dim, num_heads=16, ff_dim=32)(x)
         x = GlobalAveragePooling1D()(x)
     elif cell_type == "CfC":
         x = CfC(ncp_wiring, return_sequences=False)(x)
     elif cell_type == "LTC":
         x = RNN(LTCCell(ncp_wiring), return_sequences=False)(x)
     elif cell_type == "mmRNN":
-        x = RNN(ODELSTM(64), return_sequences=False)(x)
+        x = RNN(ODELSTM(hidden_dim), return_sequences=False)(x)
     elif cell_type == "PhasedLSTM":
-        x = RNN(PhasedLSTM(64), return_sequences=False)(x)
+        x = RNN(PhasedLSTM(hidden_dim), return_sequences=False)(x)
     elif cell_type == "CT-GRU":
-        x = RNN(GRUODE(64), return_sequences=False)(x)
+        x = RNN(GRUODE(hidden_dim), return_sequences=False)(x)
     elif cell_type == "CTRNN":
-        x = RNN(CTRNNCell(64, num_unfolds=5, method='euler'), return_sequences=False)(x)
+        x = RNN(CTRNNCell(hidden_dim, num_unfolds=num_unfolds, method='euler'), return_sequences=False)(x)
     elif cell_type == "NODE":
-        x = RNN(NODE(units=64, hidden_dim=64, num_unfolds=5),return_sequences=False)(x)
+        x = RNN(NODE(units=hidden_dim, hidden_dim=hidden_dim, num_unfolds=num_unfolds),return_sequences=False)(x)
     elif cell_type == "DeepState":
-        x = DeepState(dim=64)(x)
+        x = DeepState(dim=hidden_dim)(x)
         x = GlobalAveragePooling1D()(x)
     elif cell_type == "S4":
-        x = S4(d_model=64)(x)
+        x = S4(d_model=hidden_dim)(x)
         x = GlobalAveragePooling1D()(x)
     elif cell_type == "Mamba":
-        x = Mamba(d_model=64)(x)
+        x = Mamba(d_model=hidden_dim)(x)
         x = GlobalAveragePooling1D()(x)
     elif cell_type == "ODEFormer":
-        x = ODEformer(hidden_dim=64, num_heads=8, ff_dim=128)(x)
+        x = ODEformer(hidden_dim=hidden_dim, num_heads=8, ff_dim=128)(x)
         x = Flatten()(x)
     elif cell_type == "mTAN":
-        x = mTAN(hidden_dim=64, num_heads=16)(x)
+        x = mTAN(hidden_dim=hidden_dim, num_heads=16)(x)
     elif cell_type == 'ContiFormer':
-        x = tf.keras.layers.Dense(64)(x)         # project to expected dim
-        x = ContiFormer(dim=64, num_heads=8, ff_dim=64)(x)
+        x = tf.keras.layers.Dense(hidden_dim)(x)         # project to expected dim
+        x = ContiFormer(dim=hidden_dim, num_heads=8, ff_dim=ff_dim)(x)
         x = GlobalAveragePooling1D()(x)
     elif cell_type == "PDE-Attention":
-        x = PDEAttention(key_dim=16, num_heads=8, nt=5, dt=0.1, alpha=0.1)(x)
+        x = PDEAttention(key_dim=hidden_dim, num_heads=16, nt=num_steps, dt=0.1, alpha=0.1)(x)
         x = GlobalAveragePooling1D()(x)
     elif cell_type == "OT-Transformer":
-        x = OTTransformer(key_dim=64, num_heads=16,ff_dim=32, num_steps=5)(x)
+        x = OTTransformer(key_dim=hidden_dim, num_heads=16, ff_dim=32, num_steps=num_steps)(x)
         x = GlobalAveragePooling1D()(x)
     elif cell_type == "FLUID":
-        x = FLUID(d_model=64, num_heads=4, num_layers=1, ff_dim=32, topk=8)(x)
+        x = FLUID(d_model=hidden_dim, num_heads=4, num_layers=1, ff_dim=32, topk=8)(x)
         x = Flatten()(x)
     elif cell_type == "NAC":
-        x = NAC(d_model=64, num_heads=16, topk=32, return_sequences=False)(x)
+        x = NAC(d_model=hidden_dim, num_heads=16, topk=32, return_sequences=False)(x)
+    elif cell_type == "HiPPO":
+        x = HiPPO(d_model=hidden_dim, state_size=hidden_dim)(x)
+        x = GlobalAveragePooling1D()(x)
+    elif cell_type == "S5":
+        x = S5(d_model=hidden_dim, state_size=hidden_dim, num_heads=8)(x)
+        x = GlobalAveragePooling1D()(x)
+    elif cell_type == "NCDE":
+        x = NCDE(d_model=hidden_dim, hidden_dim=hidden_dim, num_unfolds=num_unfolds)(x)
+        x = GlobalAveragePooling1D()(x)
+    elif cell_type == "NRDE":
+        x = NRDE(d_model=hidden_dim, hidden_dim=hidden_dim, num_unfolds=num_unfolds)(x)
+        x = GlobalAveragePooling1D()(x)
+    elif cell_type == "NSDE":
+        x = NSDE(d_model=hidden_dim, hidden_dim=hidden_dim, num_unfolds=num_unfolds)(x)
+        x = GlobalAveragePooling1D()(x)
+    elif cell_type == "S7":
+        x = S7(d_model=hidden_dim, d_state=d_state, d_conv=d_conv)(x)
+        x = GlobalAveragePooling1D()(x)
+    elif cell_type == "Jamba":
+        x = Jamba(d_model=hidden_dim, num_heads=8, d_state=d_state, d_conv=d_conv)(x)
+        x = GlobalAveragePooling1D()(x)
+    elif cell_type == "RetNet":
+        x = RetNet(d_model=hidden_dim, num_heads=8)(x)
+        x = GlobalAveragePooling1D()(x)
     else:
         raise ValueError(f"Unknown cell type: {cell_type}")
 
@@ -155,10 +193,11 @@ def build_model(cell_type, input_shape=(256,2), num_classes=10):
 # MODEL TYPES
 model_types = [
     "LSTM", "GRU", "SDPA-Transformer",  #DT-models
-    "NODE", "PhasedLSTM","mmRNN",         #F1
-    "CT-GRU", "CT-RNN",'LTC','CfC', "FLUID", "NAC", #F2
-    'DeepState', "S4",      #F3
-    "Mamba", #F4
+    "NODE", "PhasedLSTM","mmRNN",         #CT baselines
+    "NCDE", "NRDE", "NSDE",              #F3 (Freely parameterized vector fields)
+    "CT-GRU", "CTRNN",'LTC','CfC', "FLUID", "NAC", #F2
+    'DeepState', "S4", "HiPPO", "S5",   #F1 (Linear dynamical systems)
+    "Mamba", "S7", "Jamba", "RetNet",   #F4 (Selective SSMs)
     "mTAN", "ODEFormer", "ContiFormer", 'OT-Transformer', 'PDE-Attention', #F5
 ]
 
@@ -179,10 +218,9 @@ def get_callbacks(model_name):
     ]
 
 # ---- K-Fold CV ----
-k_folds = 5
 results = {}
 
-skf = StratifiedKFold(n_splits=k_folds, shuffle=True, random_state=42)
+skf = StratifiedKFold(n_splits=k_folds, shuffle=True, random_state=random_state)
 
 for cell_type in model_types:
     model_name = f"{base_model_name}_{cell_type}"
@@ -197,13 +235,13 @@ for cell_type in model_types:
         X_train, X_val = X_events[train_idx], X_events[val_idx]
         y_train, y_val = y[train_idx], y[val_idx]
 
-        train_ds = tf.data.Dataset.from_tensor_slices((X_train, y_train)).shuffle(10000).batch(32)
-        val_ds = tf.data.Dataset.from_tensor_slices((X_val, y_val)).batch(32)
+        train_ds = tf.data.Dataset.from_tensor_slices((X_train, y_train)).shuffle(10000).batch(batch_size)
+        val_ds = tf.data.Dataset.from_tensor_slices((X_val, y_val)).batch(batch_size)
 
         # Build model
-        model = build_model(cell_type, input_shape=(256,2), num_classes=10)
+        model = build_model(cell_type, input_shape=(max_len, 2), num_classes=num_classes)
         model.compile(
-            optimizer=AdamW(learning_rate=0.001),
+            optimizer=AdamW(learning_rate=learning_rate),
             loss="sparse_categorical_crossentropy",
             metrics=["accuracy"]
         )
@@ -211,7 +249,7 @@ for cell_type in model_types:
         callbacks = get_callbacks(f"{model_name}_fold{fold}")
 
         # Train
-        model.fit(train_ds, validation_data=val_ds, epochs=30,callbacks=callbacks, verbose=0)
+        model.fit(train_ds, validation_data=val_ds, epochs=epochs, callbacks=callbacks, verbose=0)
 
         # Load best weights and evaluate
         model.load_weights(f"{weights_dir}/{model_name}_fold{fold}.weights.h5")
