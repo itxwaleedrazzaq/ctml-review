@@ -1788,3 +1788,768 @@ class OTTransformer(tf.keras.layers.Layer):
             "dropout_rate": self.dropout_rate,
         })
         return config
+
+
+def make_hippo_legs(N):
+    n = np.arange(N)
+    P = np.sqrt(2.0 * n + 1.0)
+    A = P[:, None] * P[None, :]
+    A = np.tril(A) - np.diag(n)
+    return (-A).astype(np.float32)
+
+
+#implemented based on https://arxiv.org/abs/2008.07669
+class HiPPO(tf.keras.layers.Layer):
+    def __init__(self, d_model, state_size=64, **kwargs):
+        super().__init__(**kwargs)
+        self.d_model = d_model
+        self.state_size = state_size
+
+        A = make_hippo_legs(state_size)
+        self.A_init = A.astype(np.float32)
+
+    def build(self, input_shape):
+        input_dim = input_shape[-1]
+        if input_dim != self.d_model:
+            self.input_proj = tf.keras.layers.Dense(self.d_model, use_bias=True, name="input_proj")
+        else:
+            self.input_proj = tf.identity
+
+        # Continuous-time HiPPO-LegS matrix (fixed, non trainable)
+        self.A = tf.constant(self.A_init, dtype=tf.float32)                 # (N, N)
+
+        B_legs = np.tile(np.sqrt(2.0 * np.arange(self.state_size) + 1.0),
+                         (self.d_model, 1)).astype(np.float32)
+        self.B = self.add_weight(
+            name="B", shape=(self.d_model, self.state_size),
+            initializer=tf.constant_initializer(B_legs), trainable=True)
+        # Readout C: (d_model, state_size)
+        self.C = self.add_weight(
+            name="C", shape=(self.d_model, self.state_size),
+            initializer=tf.keras.initializers.RandomNormal(0.0, 0.05), trainable=True)
+        # Skip / feedthrough D: (d_model,)
+        self.D = self.add_weight(
+            name="D", shape=(self.d_model,), initializer="zeros", trainable=True)
+        # Learned step size, as in S4/Mamba. A fixed global dt = 1/L made the
+        # layer a near-integrator that learns poorly; a trainable scalar step
+        # gives the filter a learnable timescale relative to the window 1/L.
+        self.log_step = self.add_weight(
+            name="log_step", shape=(),
+            initializer=tf.constant_initializer(np.log(1.0)), trainable=True)
+        super().build(input_shape)
+
+    def call(self, u):
+        # u: (B, L, D_in)
+        x = self.input_proj(u)  # (B, L, d_model)
+
+        batch_size = tf.shape(x)[0]
+        L = tf.shape(x)[1]
+        N = self.state_size
+
+        # Learned step size relative to the window: dt = exp(log_step) / L.
+        # exp is strictly positive; normalising by L keeps the bilinear step
+        # order-appropriate to the sequence length.
+        dt = tf.exp(self.log_step) / tf.cast(L, tf.float32)
+
+        I = tf.eye(N, dtype=tf.float32)
+
+        # Bilinear discretization of the HiPPO-LegS dynamics x' = A x + B u:
+        #   A_bar = (I - .5 dt A)^{-1} (I + .5 dt A)
+        #   B_bar = dt (I - .5 dt A)^{-1} B
+        # A is lower triangular, so both solves are lower-triangular.
+        M = I - 0.5 * dt * self.A
+
+        A_bar = tf.linalg.triangular_solve(
+            M,
+            I + 0.5 * dt * self.A,
+            lower=True,
+        )
+
+        # B has shape (d_model, N); solve for M X = B^T to get M^{-1} B^T,
+        # then B_bar = dt * (M^{-1} B^T)^T = dt * B M^{-T}  (d_model, N).
+        B_bar = dt * tf.transpose(
+            tf.linalg.triangular_solve(
+                M,
+                tf.transpose(self.B),
+                lower=True,
+            )
+        )
+
+        def step(prev, u_t):
+            # prev: (B, N); u_t: (B, d_model)
+            return (
+                tf.matmul(prev, A_bar, transpose_b=True)
+                + tf.matmul(u_t, B_bar)
+            )
+
+        h0 = tf.zeros(
+            (batch_size, N),
+            dtype=x.dtype,
+        )
+
+        h_seq = tf.scan(
+            step,
+            tf.transpose(x, (1, 0, 2)),
+            initializer=h0,
+        )
+
+        h_seq = tf.transpose(h_seq, (1, 0, 2))
+
+        y = tf.einsum("bln,dn->bld", h_seq, self.C)
+
+        return y + x * self.D[None, None, :]
+
+#implemented based on https://arxiv.org/abs/2208.04933
+class S5(tf.keras.layers.Layer):
+    """S5: Simplified State Space Layers with multi-head diagonal SSMs.
+
+    Each head carries an independent diagonal (complex) transition matrix A so
+    the state recurrence is a dense-linear associative-scan in the reference; we
+    implement the recurrent (scan) view on the time axis, which is exactly the
+    inference path and is stable for any sequence length.
+    """
+    def __init__(self, d_model, state_size=64, num_heads=4, **kwargs):
+        super().__init__(**kwargs)
+        self.d_model = d_model
+        self.state_size = state_size
+        self.num_heads = num_heads
+
+    def build(self, input_shape):
+        input_dim = input_shape[-1]
+        if input_dim != self.d_model:
+            self.input_proj = tf.keras.layers.Dense(self.d_model, use_bias=True, name="input_proj")
+        else:
+            self.input_proj = tf.identity
+
+        head_dim = self.d_model // self.num_heads
+        assert self.d_model % self.num_heads == 0, "d_model must be divisible by num_heads"
+
+        # Per-head, per-state log magnitude -> strictly-negative real part
+        log_omega = np.broadcast_to(
+            np.log(0.5 + np.linspace(0.5, 1.0, self.state_size)).astype(np.float32),
+            (self.num_heads, self.state_size))
+        self.log_omega = self.add_weight(
+            name="log_omega", shape=(self.num_heads, self.state_size),
+            initializer=tf.constant_initializer(log_omega), trainable=True)
+        # Per-head, per-state phase (imag part)
+        self.theta = self.add_weight(
+            name="theta", shape=(self.num_heads, self.state_size),
+            initializer=tf.keras.initializers.RandomNormal(0.0, 0.05), trainable=True)
+        self.log_step = self.add_weight(
+            name="log_step", shape=(self.d_model,),
+            initializer=tf.random_uniform_initializer(np.log(0.001), np.log(0.1)), trainable=True)
+
+        # Input coupling B and readout C (per head)
+        self.Bw = self.add_weight(
+            name="Bw", shape=(self.d_model, self.state_size),
+            initializer=tf.keras.initializers.RandomNormal(0.0, 0.05), trainable=True)
+        self.Cw = self.add_weight(
+            name="Cw", shape=(self.d_model, self.state_size),
+            initializer=tf.keras.initializers.RandomNormal(0.0, 0.05), trainable=True)
+        self.D = self.add_weight(
+            name="D", shape=(self.d_model,), initializer="zeros", trainable=True)
+        super().build(input_shape)
+
+    def call(self, u):
+        # x: (B, L, D_in); projected to d_model. Implements the multi-head
+        # diagonal SSM as a single dense recurrence over a (B, d_model, state_size)
+        # state tensor (every channel owns its set of state variables), scanned
+        # along the time axis exactly as in the reference S5/inference path.
+        x = self.input_proj(u)                              # (B, L, d_model)
+        batch = tf.shape(x)[0]
+        L = tf.shape(x)[1]
+
+        d_model = self.d_model
+        N = self.state_size                                 # state order per channel
+
+        # Per-head diagonal complex decay, broadcast over the head's channels.
+        # Build a (d_model, N) complex-valued lambda by repeating each head's
+        # eigen-spectrum across the head_dim channels that belong to that head.
+        head_dim = d_model // self.num_heads
+        real = -tf.nn.softplus(self.log_omega)              # (num_heads, N)
+        lam = tf.complex(real, self.theta)                  # (num_heads, N)
+        lam = tf.repeat(lam, repeats=head_dim, axis=0)      # (d_model, N)
+
+        dt = tf.exp(tf.clip_by_value(self.log_step, np.log(0.001), np.log(0.1)))  # (d_model,)
+        dt = tf.cast(tf.reshape(dt, (-1, 1)), tf.complex64)  # (d_model, 1)
+        abar = tf.exp(dt * lam)                              # (d_model, N) complex
+
+        Bc = tf.complex(self.Bw, tf.zeros_like(self.Bw))     # (d_model, N)
+        Cc = tf.complex(self.Cw, tf.zeros_like(self.Cw))
+
+        # Orient per-timestep params (time-invariant, so broadcast over B and L)
+        abar_t = tf.tile(abar[None, None, :, :], [batch, L, 1, 1])   # (B, L, d_model, N)
+        xc = tf.cast(x, tf.complex64)
+        Bx = tf.expand_dims(xc, -1) * Bc[None, None, :, :]           # (B, L, d_model, N)
+        C_t = tf.tile(Cc[None, None, :, :], [batch, L, 1, 1])
+
+        # time-major orientation for tf.scan (stable to autograph as in Mamba)
+        a_t = tf.transpose(abar_t, [1, 0, 2, 3])   # (L, B, d_model, N)
+        bx_t = tf.transpose(Bx, [1, 0, 2, 3])      # (L, B, d_model, N)
+        c_t = tf.transpose(C_t, [1, 0, 2, 3])
+
+        def step(prev, elem):
+            h_prev = prev[0]
+            y_prev = prev[1]
+            ab, Bx, C = elem
+            h = ab * h_prev + Bx                     # (B, d_model, N)
+            y = tf.reduce_sum(C * h, axis=-1)        # (B, d_model)
+            return (h, y)
+
+        h_init = tf.zeros((batch, d_model, N), dtype=tf.complex64)
+        y_init = tf.zeros((batch, d_model), dtype=tf.complex64)
+        _, y_seq = tf.scan(step, (a_t, bx_t, c_t), (h_init, y_init))
+        out = tf.math.real(tf.transpose(y_seq, [1, 0, 2]))   # (B, L, d_model)
+
+        return out + x * self.D[None, None, :]
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "d_model": self.d_model,
+            "state_size": self.state_size,
+            "num_heads": self.num_heads,
+        })
+        return config
+
+
+# ------------------------------------------------------------------------------
+# Family III: Freely Parameterized Vector Fields
+# ------------------------------------------------------------------------------
+#implemented based on https://arxiv.org/abs/2005.08926
+class NCDE(tf.keras.layers.Layer):
+    """Neural Controlled Differential Equation.
+
+    Continuous input representation: the discrete path is interpolated to a
+    continuous path U(s) and the latent state solves the controlled ODE
+        dz = f(z; x) dU(s)   (Riemann-Stieltjes integral),
+    discretised on the fixed grid with num_unfolds Euler subdivisions per step.
+    """
+    def __init__(self, d_model, hidden_dim=None, num_unfolds=4, **kwargs):
+        super().__init__(**kwargs)
+        self.d_model = d_model
+        self.hidden_dim = hidden_dim or 4 * d_model
+        self.num_unfolds = num_unfolds
+
+    def build(self, input_shape):
+        input_dim = input_shape[-1]
+        if input_dim != self.d_model:
+            self.input_proj = tf.keras.layers.Dense(self.d_model, use_bias=True, name="input_proj")
+        else:
+            self.input_proj = tf.identity
+        # Vector field f([z; x(t)]) -> dz
+        self.dynamics = tf.keras.Sequential([
+            tf.keras.layers.Dense(self.hidden_dim, activation="tanh", name="cdc_hidden"),
+            tf.keras.layers.Dense(self.d_model, activation=None, name="cdc_out"),
+        ], name="cdc_dynamics")
+        super().build(input_shape)
+
+    def call(self, u):
+        x = self.input_proj(u)                        # (B, L, d_model)
+        B, L = tf.unstack(tf.shape(x))[:2]
+        d_model = self.d_model
+        n = self.num_unfolds
+        dt_st = 1.0 / float(n)                        # per-substep measure
+
+        # Path increments per timestep (uniform grid, total measure 1 per step)
+        x_next = tf.concat([x[:, 1:, :], x[:, -1:, :]], axis=1)   # (B, L, d)
+        dU = (x_next - x) * dt_st                     # (B, L, d) substep increment
+
+        def step(z, elem):
+            x_t, dU_t = elem                          # (B, d), (B, d)
+            for _ in range(n):                        # S = num_unfolds substeps
+                fused = tf.concat([z, x_t], axis=-1)
+                fv = self.dynamics(fused)             # (B, d)
+                z = z + fv * dU_t                     # Euler-Riemann-Stieltjes
+            return z
+
+        z0 = tf.zeros((B, d_model), dtype=x.dtype)
+        z_seq = tf.scan(
+            step,
+            (tf.transpose(x, (1, 0, 2)), tf.transpose(dU, (1, 0, 2))),
+            z0,
+        )
+        z_seq = tf.transpose(z_seq, (1, 0, 2))        # (B, L, d_model)
+        return z_seq + x
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"d_model": self.d_model, "hidden_dim": self.hidden_dim,
+                       "num_unfolds": self.num_unfolds})
+        return config
+
+
+#implemented based on https://arxiv.org/abs/2009.08295 (Neural rough differential equations)
+class NRDE(tf.keras.layers.Layer):
+    """Neural Rough Differential Equation.
+
+    Handles non-smooth inputs by driving the latent state with a (truncated)
+    rough-path lift V(s) of the input, i.e. the controlled ODE is
+        dz = f(z; x) dV(s),
+    where the path lift carries both the increment (level-1) and a second-order
+    (level-2 / Levy-area style) term that captures local non-smoothness.
+    """
+    def __init__(self, d_model, hidden_dim=None, num_unfolds=4, **kwargs):
+        super().__init__(**kwargs)
+        self.d_model = d_model
+        self.hidden_dim = hidden_dim or 4 * d_model
+        self.num_unfolds = num_unfolds
+
+    def build(self, input_shape):
+        input_dim = input_shape[-1]
+        if input_dim != self.d_model:
+            self.input_proj = tf.keras.layers.Dense(self.d_model, use_bias=True, name="input_proj")
+        else:
+            self.input_proj = tf.identity
+        self.dynamics = tf.keras.Sequential([
+            tf.keras.layers.Dense(self.hidden_dim, activation="tanh", name="rde_hidden"),
+            tf.keras.layers.Dense(self.d_model, activation=None, name="rde_out"),
+        ], name="rde_dynamics")
+        super().build(input_shape)
+
+    def call(self, u):
+        x = self.input_proj(u)                        # (B, L, d_model)
+        B, L = tf.unstack(tf.shape(x))[:2]
+        d_model = self.d_model
+        n = self.num_unfolds
+        dt_st = 1.0 / float(n)
+
+        x_next = tf.concat([x[:, 1:, :], x[:, -1:, :]], axis=1)
+        inc = (x_next - x)                            # level-1 increment (B, L, d)
+        # level-2 rough-path area term (antisymmetric, cheap approximation)
+        area = inc * tf.roll(inc, shift=1, axis=1)    # (B, L, d)
+        dV = (inc + 0.5 * area) * dt_st               # (B, L, d) rough control
+
+        def step(z, elem):
+            x_t, dV_t = elem                          # (B, d)
+            for _ in range(n):
+                fused = tf.concat([z, x_t], axis=-1)
+                fv = self.dynamics(fused)
+                z = z + fv * dV_t
+            return z
+
+        z0 = tf.zeros((B, d_model), dtype=x.dtype)
+        z_seq = tf.scan(
+            step,
+            (tf.transpose(x, (1, 0, 2)), tf.transpose(dV, (1, 0, 2))),
+            z0,
+        )
+        z_seq = tf.transpose(z_seq, (1, 0, 2))        # (B, L, d_model)
+        return z_seq + x
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"d_model": self.d_model, "hidden_dim": self.hidden_dim,
+                       "num_unfolds": self.num_unfolds})
+        return config
+
+
+#implemented based on https://arxiv.org/abs/2001.01328
+class NSDE(tf.keras.layers.Layer):
+    """Neural Stochastic Differential Equation.
+
+    Adds a learned diffusion term:
+        dz = f(z; x) dt + g(z; x) dW(t),   dW ~ N(0, dt)
+    integrated with the Euler-Maruyama scheme on the fixed grid. The diffusion
+    acts as a trajectory-level regulariser / generative-noise source.
+    """
+    def __init__(self, d_model, hidden_dim=None, num_unfolds=4, **kwargs):
+        super().__init__(**kwargs)
+        self.d_model = d_model
+        self.hidden_dim = hidden_dim or 4 * d_model
+        self.num_unfolds = num_unfolds
+
+    def build(self, input_shape):
+        input_dim = input_shape[-1]
+        if input_dim != self.d_model:
+            self.input_proj = tf.keras.layers.Dense(self.d_model, use_bias=True, name="input_proj")
+        else:
+            self.input_proj = tf.identity
+        self.drift = tf.keras.Sequential([
+            tf.keras.layers.Dense(self.hidden_dim, activation="tanh", name="sde_drift_h"),
+            tf.keras.layers.Dense(self.d_model, activation=None, name="sde_drift_o"),
+        ], name="sde_drift")
+        self.diffusion = tf.keras.Sequential([
+            tf.keras.layers.Dense(self.hidden_dim, activation="tanh", name="sde_diff_h"),
+            tf.keras.layers.Dense(self.d_model, activation="softplus", name="sde_diff_o"),
+        ], name="sde_diffusion")
+        super().build(input_shape)
+
+    def call(self, u, training=None):
+        del training  # stochasticity always active (regulariser, as in reference)
+        x = self.input_proj(u)                        # (B, L, d_model)
+        B, L = tf.unstack(tf.shape(x))[:2]
+        d_model = self.d_model
+        n = self.num_unfolds
+        dt_st = 1.0 / float(n)
+        dts = tf.constant(dt_st, dtype=x.dtype)
+        sqdt = tf.sqrt(dts)
+
+        def step(z, elem):
+            x_t = elem                                # (B, d)
+            for _ in range(n):
+                fused = tf.concat([z, x_t], axis=-1)
+                drift = self.drift(fused)
+                diff = self.diffusion(fused)
+                dw = tf.random.normal(tf.shape(z), dtype=x.dtype)
+                z = z + drift * dts + diff * sqdt * dw     # Euler-Maruyama
+            return z
+
+        z0 = tf.zeros((B, d_model), dtype=x.dtype)
+        z_seq = tf.scan(step, tf.transpose(x, (1, 0, 2)), z0)
+        z_seq = tf.transpose(z_seq, (1, 0, 2))        # (B, L, d_model)
+        return z_seq + x
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"d_model": self.d_model, "hidden_dim": self.hidden_dim,
+                       "num_unfolds": self.num_unfolds})
+        return config
+
+# Family IV: Selective State-Space Models
+
+#implemented based on https://arxiv.org/abs/2410.03464 
+class S7(tf.keras.layers.Layer):
+    """S7: a selective state-space model with an elementwise nonlinearity.
+
+    Dynamics:  x' = A x + B u + sigma(x),  discretised by ZOH and run as a
+    parallel associative scan (implemented as a scan over time). The extra
+    elementwise nonlinearity on the hidden state distinguishes S7 from Mamba.
+    """
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2,
+                 dt_rank="auto", **kwargs):
+        super().__init__(**kwargs)
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
+        self.d_inner = int(expand * d_model)
+        self.dt_rank = math.ceil(d_model / 16) if dt_rank == "auto" else dt_rank
+
+    def build(self, input_shape):
+        input_dim = int(input_shape[-1])
+        if input_dim != self.d_model:
+            self.input_proj = tf.keras.layers.Dense(self.d_model, use_bias=True, name="input_proj")
+        else:
+            self.input_proj = tf.identity
+
+        self.in_proj = tf.keras.layers.Dense(self.d_inner * 2, use_bias=False, name="in_proj")
+        self.conv1d = tf.keras.layers.Conv1D(
+            self.d_inner, kernel_size=self.d_conv, groups=self.d_inner,
+            padding="causal", use_bias=True, name="conv1d")
+        self.x_proj = tf.keras.layers.Dense(
+            self.dt_rank + 2 * self.d_state, use_bias=False, name="x_proj")
+        self.dt_proj = tf.keras.layers.Dense(self.d_inner, use_bias=True, name="dt_proj")
+
+        A = np.tile(np.log(np.arange(1, self.d_state + 1, dtype=np.float32)),
+                    (self.d_inner, 1))
+        self.A_log = self.add_weight(name="A_log", shape=(self.d_inner, self.d_state),
+                                     initializer=tf.constant_initializer(A), trainable=True)
+        self.D = self.add_weight(name="D", shape=(self.d_inner,),
+                                 initializer=tf.ones_initializer(), trainable=True)
+        self.dt_bias = self.add_weight(name="dt_bias", shape=(self.d_inner,),
+                                       initializer="zeros", trainable=True)
+        self.out_proj = tf.keras.layers.Dense(self.d_model, use_bias=False, name="out_proj")
+        super().build(input_shape)
+
+    def selective_scan(self, u, delta, A, B, C):
+        """Selective scan with the S7 elementwise state nonlinearity.
+
+        S7's distinguishing feature is an elementwise nonlinearity, but it must
+        be applied in a *stable* way (the paper's key claim is a stable
+        reparameterisation that keeps state transitions well-behaved over
+        time). The old implementation folded the nonlinearity into the hidden
+        state each step as `h = h + silu(h)`; that map has derivative up to 2,
+        so the state grows without bound and diverges to inf/NaN at realistic
+        input scales or long sequences. Here the silu is applied to the
+        (bounded) excitation term instead, so the homogeneous decay exp(dt*A)
+        (A < 0, dt > 0 -> in (0,1]) is a strict contraction and the recurrence
+        is unconditionally stable while retaining the elementwise nonlinearity.
+        """
+        d_inner = self.d_inner
+        d_state = self.d_state
+        batch = tf.shape(u)[0]
+        L = tf.shape(u)[1]
+
+        deltaA = tf.exp(delta[..., None] * A)                       # (B,L,d_inner,d_state)
+        deltaB = delta[..., None] * B[..., None, :]                 # (B,L,d_inner,d_state)
+        Bxu = deltaB * u[..., None]                                 # (B,L,d_inner,d_state)
+
+        dA_t = tf.transpose(deltaA, [1, 0, 2, 3])
+        Bx_t = tf.transpose(Bxu, [1, 0, 2, 3])
+        C_t = tf.transpose(C, [1, 0, 2])
+
+        def step(prev, elem):
+            h_prev, y_prev = prev[0], prev[1]
+            dA, Bx, C = elem
+            h = dA * h_prev + tf.nn.silu(Bx)                         # stable S7 transition
+            y = tf.reduce_sum(C[:, None, :] * h, axis=-1)            # (B,d_inner)
+            return (h, y)
+
+        init = (tf.zeros((batch, d_inner, d_state)), tf.zeros((batch, d_inner)))
+        _, y_seq = tf.scan(step, (dA_t, Bx_t, C_t), init)
+        return tf.transpose(y_seq, [1, 0, 2])                        # (B, L, d_inner)
+
+    def call(self, inputs):
+        x = self.input_proj(inputs)
+        batch = tf.shape(x)[0]
+
+        proj = self.in_proj(x)
+        x, gate = tf.split(proj, 2, axis=-1)
+        x = tf.nn.silu(self.conv1d(x))
+
+        dtB_C = self.x_proj(x)
+        dt_rank = self.dt_rank
+        dt_proj_raw = dtB_C[..., :dt_rank]
+        B = dtB_C[..., dt_rank:dt_rank + self.d_state]
+        C = dtB_C[..., dt_rank + self.d_state:]
+        dt = tf.nn.softplus(self.dt_proj(dt_proj_raw) + self.dt_bias)
+        A = -tf.exp(self.A_log)
+
+        y = self.selective_scan(x, dt, A, B, C)
+        y = y + self.D[None, None, :] * x
+        out = y * tf.nn.silu(gate)
+        return self.out_proj(out)                                    # (B, L, d_model)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"d_model": self.d_model, "d_state": self.d_state,
+                       "d_conv": self.d_conv, "expand": self.expand,
+                       "dt_rank": self.dt_rank})
+        return config
+
+
+#implemented based on https://arxiv.org/abs/2403.19887 (Jamba: Mamba + attention + MoE)
+class Jamba(tf.keras.layers.Layer):
+    """Jamba: a hybrid block interleaving a Mamba selective SSM, multi-head
+    attention, and a mixture-of-experts (MoE) feed-forward with a learned
+    router. The whole block maps (B, L, D_in) -> (B, L, d_model).
+    """
+    def __init__(self, d_model, num_heads=4, d_state=16, d_conv=4, expand=2,
+                 num_experts=4, top_k=2, dropout=0.0, **kwargs):
+        super().__init__(**kwargs)
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
+        self.d_inner = int(expand * d_model)
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.dropout_rate = dropout
+        self.dt_rank = math.ceil(d_model / 16)
+
+    def build(self, input_shape):
+        input_dim = int(input_shape[-1])
+        if input_dim != self.d_model:
+            self.input_proj = tf.keras.layers.Dense(self.d_model, use_bias=True, name="input_proj")
+        else:
+            self.input_proj = tf.identity
+
+        # --- Mamba selective SSM sub-block ---
+        self.m_in_proj = tf.keras.layers.Dense(self.d_inner * 2, use_bias=False, name="m_in_proj")
+        self.m_conv = tf.keras.layers.Conv1D(
+            self.d_inner, kernel_size=self.d_conv, groups=self.d_inner,
+            padding="causal", use_bias=True, name="m_conv")
+        self.m_x_proj = tf.keras.layers.Dense(
+            self.dt_rank + 2 * self.d_state, use_bias=False, name="m_x_proj")
+        self.m_dt_proj = tf.keras.layers.Dense(self.d_inner, use_bias=True, name="m_dt_proj")
+        A = np.tile(np.log(np.arange(1, self.d_state + 1, dtype=np.float32)),
+                    (self.d_inner, 1))
+        self.m_A_log = self.add_weight(name="m_A_log", shape=(self.d_inner, self.d_state),
+                                       initializer=tf.constant_initializer(A), trainable=True)
+        self.m_D = self.add_weight(name="m_D", shape=(self.d_inner,), initializer="ones", trainable=True)
+        self.m_dt_bias = self.add_weight(name="m_dt_bias", shape=(self.d_inner,), initializer="zeros", trainable=True)
+        self.m_out = tf.keras.layers.Dense(self.d_model, use_bias=False, name="m_out")
+
+        # --- Attention sub-block ---
+        self.mha = tf.keras.layers.MultiHeadAttention(
+            num_heads=self.num_heads, key_dim=self.d_model // self.num_heads)
+        self.attn_norm = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+
+        # --- Mixture-of-Experts sub-block ---
+        self.router = tf.keras.layers.Dense(self.num_experts, use_bias=False, name="router")
+        self.experts = [
+            tf.keras.Sequential([
+                tf.keras.layers.Dense(self.d_model * 2, activation="relu", name=f"ex{i}_h"),
+                tf.keras.layers.Dense(self.d_model, activation=None, name=f"ex{i}_o"),
+            ]) for i in range(self.num_experts)
+        ]
+        self.moe_norm = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.dropout = tf.keras.layers.Dropout(self.dropout_rate)
+        super().build(input_shape)
+
+    def selective_scan(self, u, delta, A, B, C):
+        d_inner = self.d_inner
+        d_state = self.d_state
+        batch = tf.shape(u)[0]
+        deltaA = tf.exp(delta[..., None] * A)
+        deltaB = delta[..., None] * B[..., None, :]
+        Bxu = deltaB * u[..., None]
+        dA_t = tf.transpose(deltaA, [1, 0, 2, 3])
+        Bx_t = tf.transpose(Bxu, [1, 0, 2, 3])
+        C_t = tf.transpose(C, [1, 0, 2])
+
+        def step(prev, elem):
+            h_prev, y_prev = prev[0], prev[1]
+            dA, Bx, C = elem
+            h = dA * h_prev + Bx
+            y = tf.reduce_sum(C[:, None, :] * h, axis=-1)
+            return (h, y)
+
+        init = (tf.zeros((batch, d_inner, d_state)), tf.zeros((batch, d_inner)))
+        _, y_seq = tf.scan(step, (dA_t, Bx_t, C_t), init)
+        return tf.transpose(y_seq, [1, 0, 2])
+
+    def mamba_block(self, x):
+        batch = tf.shape(x)[0]
+        proj = self.m_in_proj(x)
+        x0, gate = tf.split(proj, 2, axis=-1)
+        x0 = tf.nn.silu(self.m_conv(x0))
+        dtB_C = self.m_x_proj(x0)
+        dt_rank = self.dt_rank
+        dt_proj_raw = dtB_C[..., :dt_rank]
+        B = dtB_C[..., dt_rank:dt_rank + self.d_state]
+        C = dtB_C[..., dt_rank + self.d_state:]
+        dt = tf.nn.softplus(self.m_dt_proj(dt_proj_raw) + self.m_dt_bias)
+        A = -tf.exp(self.m_A_log)
+        y = self.selective_scan(x0, dt, A, B, C)
+        y = y + self.m_D[None, None, :] * x0
+        out = y * tf.nn.silu(gate)
+        return self.m_out(out)
+
+    def moe(self, x):
+        # scalar router over per-token logits
+        logits = self.router(x)                       # (B, L, num_experts)
+        weights = tf.nn.softmax(logits, axis=-1)
+        top_vals, top_idx = tf.math.top_k(weights, k=self.top_k)
+        out = tf.zeros_like(x)
+        for i in range(self.num_experts):
+            mask = tf.cast(tf.equal(top_idx, i), x.dtype)
+            masked = tf.reduce_sum(mask, axis=-1, keepdims=True)      # (B,L,1)
+            # average expert contribution weighted by its top-k weight
+            w = tf.reduce_sum(tf.where(tf.equal(top_idx, i), top_vals, 0.0), axis=-1, keepdims=True)
+            out += self.experts[i](x) * w * masked
+        return out
+
+    def call(self, inputs, training=None):
+        x = self.input_proj(inputs)
+        # 1) Mamba selective SSM (residual)
+        x = x + self.mamba_block(x)
+        # 2) Multi-head attention (residual, pre-norm)
+        a = self.attn_norm(x)
+        x = x + self.dropout(self.mha(a, a, a, training=training), training=training)
+        # 3) MoE feed-forward (residual, pre-norm)
+        g = self.moe_norm(x)
+        x = x + self.moe(g)
+        return x
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"d_model": self.d_model, "num_heads": self.num_heads,
+                       "d_state": self.d_state, "d_conv": self.d_conv,
+                       "expand": self.expand, "num_experts": self.num_experts,
+                       "top_k": self.top_k, "dropout": self.dropout_rate})
+        return config
+
+
+#implemented based on https://arxiv.org/abs/2307.08621 (RetNet: retention)
+class RetNet(tf.keras.layers.Layer):
+    """RetNet: a linear-attention-style retention network.
+
+    On a chunk, retention is
+        R_n = Q_n  osum( gamma^(n-m)  outer(K_m, V_m) ),   gamma in (0, 1]
+    implemented here in its recurrent / parallel view with per-head, learnable
+    multi-scale decay gamma_h = base_gamma^(2*h) as in the reference.
+    """
+    def __init__(self, d_model, num_heads=4, ff_dim=None, dropout=0.0, **kwargs):
+        super().__init__(**kwargs)
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.ff_dim = ff_dim or 2 * d_model
+        self.dropout_rate = dropout
+
+    def build(self, input_shape):
+        input_dim = int(input_shape[-1])
+        if input_dim != self.d_model:
+            self.input_proj = tf.keras.layers.Dense(self.d_model, use_bias=True, name="input_proj")
+        else:
+            self.input_proj = tf.identity
+        self.q_dense = tf.keras.layers.Dense(self.d_model, use_bias=False, name="q")
+        self.k_dense = tf.keras.layers.Dense(self.d_model, use_bias=False, name="k")
+        self.v_dense = tf.keras.layers.Dense(self.d_model, use_bias=False, name="v")
+        self.o_dense = tf.keras.layers.Dense(self.d_model, use_bias=False, name="o")
+
+        # multi-scale decays: gamma_h = base^(2^h), h = head index.
+        # IMPORTANT: compute g in float64 and floor it at a small positive
+        # value. With many heads base^(2^h) underflows to exactly 0 in float32
+        # (e.g. 0.9^1024 ~ 4.7e-47 < float32 min), so np.log(g) becomes -inf and
+        # the Adam/AdamW step then turns log_gamma into all-NaN, NaNs the loss.
+        base = 0.9
+        g = np.clip(
+            np.array([base ** (2 ** j) for j in range(self.num_heads)], dtype=np.float64),
+            1e-6, 1.0,
+        )
+        self.log_gamma = self.add_weight(
+            name="log_gamma", shape=(self.num_heads,),
+            initializer=tf.constant_initializer(np.log(g).astype(np.float32)),
+            trainable=True)
+
+        self.ffn = tf.keras.Sequential([
+            tf.keras.layers.Dense(self.ff_dim, activation="relu"),
+            tf.keras.layers.Dense(self.d_model),
+        ])
+        self.norm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.norm2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.dropout = tf.keras.layers.Dropout(self.dropout_rate)
+        super().build(input_shape)
+
+    def _split_heads(self, t, B):
+        t = tf.reshape(t, (B, -1, self.num_heads, self.head_dim))
+        return tf.transpose(t, [0, 2, 1, 3])          # (B, H, L, d)
+
+    def call(self, inputs, training=None):
+        x = self.input_proj(inputs)
+        B, L = tf.unstack(tf.shape(x))[:2]
+        H = self.num_heads
+        d = self.head_dim
+        gamma = tf.exp(self.log_gamma)                 # (H,) in (0,1]
+        gamma = tf.clip_by_value(gamma, 0.0, 1.0)
+
+        Q = self._split_heads(self.q_dense(x), B)      # (B,H,L,d)
+        K = self._split_heads(self.k_dense(x), B)
+        V = self._split_heads(self.v_dense(x), B)
+
+        # recurrent retention over time with per-head decay.
+        # As in the RetNet reference we L2-normalize the query and scale the
+        # score by 1/sqrt(d) (equivalently q/|q|/sqrt(d)). The old `q.h / d`
+        # with a raw query let |q.h| grow with both ||q|| and the accumulated
+        # state, so retention outputs were large and unstable across heads,
+        # which combined with the gamma underflow made training diverge.
+        def step(prev, elem):
+            h_prev, y_prev = prev[0], prev[1]
+            q, k, v = elem                            # (B, H, d)
+            # update state: h = gamma_h * h + outer(k, v)
+            h = gamma[None, :, None, None] * h_prev + tf.einsum("bhi,bhj->bhij", k, v)
+            qn = tf.math.l2_normalize(q, axis=-1)     # (B, H, d)
+            y = tf.einsum("bhi,bhij->bhj", qn, h) / tf.sqrt(tf.cast(d, q.dtype))
+            return (h, y)
+
+        q_t = tf.transpose(Q, [2, 0, 1, 3])            # (L, B, H, d)
+        k_t = tf.transpose(K, [2, 0, 1, 3])
+        v_t = tf.transpose(V, [2, 0, 1, 3])
+        init = (tf.zeros((B, H, d, d), dtype=x.dtype), tf.zeros((B, H, d), dtype=x.dtype))
+        _, y_seq = tf.scan(step, (q_t, k_t, v_t), init)
+        y_seq = tf.transpose(y_seq, [1, 2, 0, 3])      # (B, H, L, d)
+        y_seq = tf.reshape(tf.transpose(y_seq, [0, 2, 1, 3]), (B, L, self.d_model))
+        attn = self.o_dense(y_seq)
+        x = self.norm1(x + self.dropout(attn, training=training))
+        x = self.norm2(x + self.ffn(x))
+        return x
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"d_model": self.d_model, "num_heads": self.num_heads,
+                       "ff_dim": self.ff_dim, "dropout": self.dropout_rate})
+        return config
