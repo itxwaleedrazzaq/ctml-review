@@ -40,6 +40,20 @@ os.makedirs(weights_dir, exist_ok=True)
 LEAK_COLS = ['SAPS-I', 'SOFA', 'Length_of_stay', 'Survival']
 TARGET_COL = 'In-hospital_death'
 
+# SHARED HYPERPARAMETERS
+hidden_dim = ff_dim = ncp_units = 64 # model width (d_model/dim/units/embed_dim/key_dim/state_size)
+num_heads = 16                       # attention heads (default)
+num_heads_light = 8                  # heads for lighter attention modules (FLUID, NAC)
+num_unfolds = 5                      # ODE solver steps
+d_state = 16                         # S7/Jamba SSM state dimension
+d_conv = 4                           # S7/Jamba convolution width
+num_steps = 5                        # OT-Transformer iterations / PDE-Attention nt
+batch_size = 32
+learning_rate = 0.001
+epochs = 50
+k_folds = 5
+random_state = 42
+
 
 def prepare_physionet_data(file_path):
     df = pd.read_csv(file_path, index_col=0, compression='gzip')
@@ -66,55 +80,79 @@ X = X.reshape(-1, n_feats, 1)
 def build_model(cell_type, input_shape=(n_feats, 1), num_outputs=1):
     inp = Input(shape=input_shape)
     if cell_type == "LSTM":
-        x = RNN(LSTMCell(64), return_sequences=False)(inp)
+        x = RNN(LSTMCell(hidden_dim), return_sequences=False)(inp)
     elif cell_type == "GRU":
-        x = RNN(GRUCell(64), return_sequences=False)(inp)
+        x = RNN(GRUCell(hidden_dim), return_sequences=False)(inp)
     elif cell_type == "SDPA-Transformer":
-        x = SPDATransformer(embed_dim=64, num_heads=16, ff_dim=64)(inp)
+        x = SPDATransformer(embed_dim=hidden_dim, num_heads=num_heads, ff_dim=ff_dim)(inp)
         x = GlobalAveragePooling1D()(x)
     elif cell_type == "CfC":
         x = CfC(ncp_wiring, return_sequences=False)(inp)
     elif cell_type == "LTC":
         x = RNN(LTCCell(ncp_wiring), return_sequences=False)(inp)
     elif cell_type == "mmRNN":
-        x = RNN(ODELSTM(16), return_sequences=False)(inp)
+        x = RNN(ODELSTM(hidden_dim), return_sequences=False)(inp)
     elif cell_type == "PhasedLSTM":
-        x = RNN(PhasedLSTM(64), return_sequences=False)(inp)
+        x = RNN(PhasedLSTM(hidden_dim), return_sequences=False)(inp)
     elif cell_type == "CT-GRU":
-        x = RNN(GRUODE(64), return_sequences=False)(inp)
+        x = RNN(GRUODE(hidden_dim), return_sequences=False)(inp)
     elif cell_type == "CT-RNN":
-        x = RNN(CTRNNCell(64, num_unfolds=5, method='euler'), return_sequences=False)(inp)
+        x = RNN(CTRNNCell(hidden_dim, num_unfolds=num_unfolds, method='euler'), return_sequences=False)(inp)
     elif cell_type == "NODE":
-        x = RNN(NODE(units=64, hidden_dim=64, num_unfolds=5),return_sequences=False)(inp)
+        x = RNN(NODE(units=hidden_dim, hidden_dim=hidden_dim, num_unfolds=num_unfolds),return_sequences=False)(inp)
     elif cell_type == "DeepState":
-        x = DeepState(dim=64)(inp)
+        x = DeepState(dim=hidden_dim)(inp)
         x = GlobalAveragePooling1D()(x)
     elif cell_type == "S4":
-        x = S4(d_model=64)(inp)
+        x = S4(d_model=hidden_dim)(inp)
         x = GlobalAveragePooling1D()(x)
     elif cell_type == "Mamba":
-        x = Mamba(d_model=64)(inp)
+        x = Mamba(d_model=hidden_dim)(inp)
         x = GlobalAveragePooling1D()(x)
     elif cell_type == "ODEFormer":
-        x = ODEformer(hidden_dim=64, num_heads=16, ff_dim=64)(inp)
+        x = ODEformer(hidden_dim=hidden_dim, num_heads=num_heads, ff_dim=ff_dim)(inp)
         x = GlobalAveragePooling1D()(x)
     elif cell_type == "mTAN":
-        x = mTAN(hidden_dim=64, num_heads=16)(inp)
+        x = mTAN(hidden_dim=hidden_dim, num_heads=num_heads)(inp)
     elif cell_type == 'ContiFormer':
-        x = tf.keras.layers.Dense(64)(inp)         # project to expected dim
-        x = ContiFormer(dim=64, num_heads=16, ff_dim=64)(x)
+        x = tf.keras.layers.Dense(hidden_dim)(inp)         # project to expected dim
+        x = ContiFormer(dim=hidden_dim, num_heads=num_heads, ff_dim=ff_dim)(x)
         x = GlobalAveragePooling1D()(x)
     elif cell_type == "PDE-Attention":
-        x = PDEAttention(key_dim=64, num_heads=16, nt=5, dt=0.1, alpha=0.1)(inp)
+        x = PDEAttention(key_dim=hidden_dim, num_heads=num_heads, nt=num_steps, dt=0.1, alpha=0.1)(inp)
         x = GlobalAveragePooling1D()(x)
     elif cell_type == "OT-Transformer":
-        x = OTTransformer(key_dim=64, num_heads=16, ff_dim=64, num_steps=5)(inp)
+        x = OTTransformer(key_dim=hidden_dim, num_heads=num_heads, ff_dim=ff_dim, num_steps=num_steps)(inp)
         x = GlobalAveragePooling1D()(x)
     elif cell_type == "FLUID":
-        x = FLUID(d_model=64, num_heads=8, num_layers=1, ff_dim=64, topk=8)(inp)
+        x = FLUID(d_model=hidden_dim, num_heads=num_heads_light, num_layers=1, ff_dim=ff_dim, topk=8)(inp)
         x = GlobalAveragePooling1D()(x)
     elif cell_type == "NAC":
-        x = NAC(d_model=64, num_heads=8, topk=8, return_sequences=False)(inp)
+        x = NAC(d_model=hidden_dim, num_heads=num_heads_light, topk=8, return_sequences=False)(inp)
+    elif cell_type == "HiPPO":
+        x = HiPPO(d_model=hidden_dim, state_size=hidden_dim)(inp)
+        x = GlobalAveragePooling1D()(x)
+    elif cell_type == "S5":
+        x = S5(d_model=hidden_dim, state_size=hidden_dim, num_heads=num_heads)(inp)
+        x = GlobalAveragePooling1D()(x)
+    elif cell_type == "NCDE":
+        x = NCDE(d_model=hidden_dim, hidden_dim=hidden_dim, num_unfolds=num_unfolds)(inp)
+        x = GlobalAveragePooling1D()(x)
+    elif cell_type == "NRDE":
+        x = NRDE(d_model=hidden_dim, hidden_dim=hidden_dim, num_unfolds=num_unfolds)(inp)
+        x = GlobalAveragePooling1D()(x)
+    elif cell_type == "NSDE":
+        x = NSDE(d_model=hidden_dim, hidden_dim=hidden_dim, num_unfolds=num_unfolds)(inp)
+        x = GlobalAveragePooling1D()(x)
+    elif cell_type == "S7":
+        x = S7(d_model=hidden_dim, d_state=d_state, d_conv=d_conv)(inp)
+        x = GlobalAveragePooling1D()(x)
+    elif cell_type == "Jamba":
+        x = Jamba(d_model=hidden_dim, num_heads=num_heads, d_state=d_state, d_conv=d_conv)(inp)
+        x = GlobalAveragePooling1D()(x)
+    elif cell_type == "RetNet":
+        x = RetNet(d_model=hidden_dim, num_heads=num_heads)(inp)
+        x = GlobalAveragePooling1D()(x)
     else:
         raise ValueError(f"Unknown cell type: {cell_type}")
 
@@ -123,7 +161,7 @@ def build_model(cell_type, input_shape=(n_feats, 1), num_outputs=1):
     return Model(inp, out)
 
 
-ncp_wiring = AutoNCP(units=64, output_size=1)  # single scalar output
+ncp_wiring = AutoNCP(units=ncp_units, output_size=1)  # single scalar output
 
 
 # Callbacks
@@ -143,16 +181,17 @@ def get_callbacks(model_name):
 # MODEL TYPES
 model_types = [
     "LSTM", "GRU", "SDPA-Transformer",  #DT-models
-    "NODE", "PhasedLSTM","mmRNN",         #F1
-    "CT-GRU", "CT-RNN",'LTC','CfC', "FLUID", "NAC", #F2
-    'DeepState', "S4",      #F3
-    "Mamba", #F4
+    'DeepState', "HiPPO", "S4", "S5",   #F1 (Linear dynamical systems)
+    "CT-GRU", "CT-RNN", "PhasedLSTM",'LTC','CfC', "FLUID", "NAC", #F2
+    "NODE", "NCDE", "NRDE", "NSDE", "mmRNN",      #F3 (Freely parameterized vector fields)
+    "Mamba",  "Jamba", "RetNet", "S7",   #F4 (Selective SSMs)
     "mTAN", "ODEFormer", "ContiFormer", 'OT-Transformer', 'PDE-Attention', #F5
 ]
 
 
+
+
 # K-fold CV with AUC
-k_folds = 5
 results = {}
 
 for cell_type in model_types:
@@ -160,7 +199,7 @@ for cell_type in model_types:
     print(f"\nTraining {model_name} with {k_folds}-fold CV...")
 
     fold_auc = []
-    kf = KFold(n_splits=k_folds, shuffle=True, random_state=42)
+    kf = KFold(n_splits=k_folds, shuffle=True, random_state=random_state)
     for fold, (train_idx, val_idx) in enumerate(kf.split(X, y), 1):
         print(f"  Fold {fold}/{k_folds}")
         X_train_fold, X_val_fold = X[train_idx], X[val_idx]
@@ -168,13 +207,13 @@ for cell_type in model_types:
         y_val_fold = y_val_fold.astype(np.float32)
 
         train_ds = tf.data.Dataset.from_tensor_slices((X_train_fold, y_train_fold)) \
-                                  .shuffle(buffer_size=5000).batch(32)
-        val_ds = tf.data.Dataset.from_tensor_slices((X_val_fold, y_val_fold)).batch(32)
+                                  .shuffle(buffer_size=5000).batch(batch_size)
+        val_ds = tf.data.Dataset.from_tensor_slices((X_val_fold, y_val_fold)).batch(batch_size)
 
         model = build_model(cell_type)
-        model.compile(optimizer=AdamW(learning_rate=0.001),
+        model.compile(optimizer=AdamW(learning_rate=learning_rate),
                       loss='binary_crossentropy', metrics=['accuracy'])
-        model.fit(train_ds, validation_data=val_ds, epochs=50,
+        model.fit(train_ds, validation_data=val_ds, epochs=epochs,
                   callbacks=get_callbacks(f"{model_name}_fold{fold}"), verbose=0)
 
         model.load_weights(f"{weights_dir}/{model_name}_fold{fold}.weights.h5")
